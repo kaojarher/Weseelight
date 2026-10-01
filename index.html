@@ -1,0 +1,253 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>投影映射工具</title>
+<link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon.svg">
+<meta name="theme-color" content="#0b0b10"><meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:#000;color:#eee;font:14px system-ui,sans-serif;overflow:hidden;touch-action:none}
+#stage{position:fixed;inset:0;overflow:hidden}
+.layer{position:absolute;left:0;top:0;width:640px;height:360px;transform-origin:0 0;overflow:hidden;background:#000}
+.layer>*{width:100%;height:100%;object-fit:fill;display:block}
+#gl,#ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.h{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;border:2px solid #4af;background:#44aaff44;touch-action:none;color:#4af;font-size:11px;display:grid;place-items:center}
+.h.s{width:34px;height:34px;margin:-17px 0 0 -17px;border-color:#fa4;background:#ffaa4433}
+#panel{position:fixed;left:0;right:0;bottom:0;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:#111d;backdrop-filter:blur(8px);display:flex;flex-wrap:wrap;gap:8px;align-items:center;max-height:45vh;overflow:auto;touch-action:pan-y}
+#tabs{display:flex;gap:6px}
+button,select{background:#222;color:#eee;border:1px solid #444;border-radius:8px;padding:9px 12px;font:inherit}
+button.on{background:#4af;color:#000;border-color:#4af}
+label{display:flex;gap:6px;align-items:center}
+#exit{display:none;position:fixed;top:calc(8px + env(safe-area-inset-top));right:8px;opacity:.25}
+.out #panel,.out .h,.out #ov{display:none}.out #exit{display:block}
+#cal{position:fixed;inset:0;z-index:100;display:none;background:#000}
+#dot{position:absolute;width:12vmin;height:12vmin;margin:-6vmin 0 0 -6vmin;border-radius:50%;background:#fff;display:none}
+#mk{position:fixed;inset:0;background:#000;z-index:90;display:none}#mk.on{display:block}
+#pc{width:100%;height:100%;display:block}#pv{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.mh{position:absolute;width:36px;height:36px;margin:-18px 0 0 -18px;border-radius:50%;border:2px solid #fa4;background:#ffaa4455;color:#fff;display:grid;place-items:center;font-size:12px;touch-action:none}
+#mb{position:absolute;left:0;right:0;bottom:0;padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:#111}
+</style></head><body>
+<div id="stage"><svg id="ov"><path id="poly" fill="none" stroke="#4af" stroke-width="1.5" stroke-dasharray="6 4"/></svg></div>
+<button id="exit">退出輸出</button>
+<div id="panel">
+<div id="tabs"></div>
+<select id="src"><option value="grid">測試格線</option><option value="gradient">動態漸層</option><option value="solid">純白</option><option value="file" disabled>匯入檔案</option></select>
+<button id="imp">匯入圖片/影片</button><input id="file" type="file" accept="image/*,video/*" hidden>
+<select id="mode"><option value="quad">四角透視</option><option value="mesh">網格變形 (Three.js)</option></select>
+<select id="gn" hidden><option value="3">3×3 控制點</option><option value="4">4×4 控制點</option><option value="5">5×5 控制點</option></select>
+<label>透明度<input id="op" type="range" min="0" max="1" step=".05" value="1"></label>
+<button id="rst">重設</button><button id="del">刪除圖層</button>
+<select id="dly"><option value="450">投影延遲：有線</option><option value="900" selected>投影延遲：標準</option><option value="1600">投影延遲：無線</option></select><button id="cam">📷 相機校正</button><button id="out">輸出模式</button><button id="fs">全螢幕</button><button id="ins" hidden>安裝 App</button>
+</div>
+<script>
+const $=s=>document.querySelector(s),stage=$('#stage'),BW=640,BH=360,S=20;
+let L=[],sel=0,W=innerWidth,H=innerHeight,hs=[],R,scene,cam,th;
+const quad=i=>{const o=i*.04;return[[.2+o,.2+o],[.8+o/2,.2+o],[.8+o/2,.8],[.2+o,.8]]};
+const lerp=(a,b,t)=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t];
+// 單應矩陣：四角模式用 CSS matrix3d
+function homo(s,d){const A=[];for(let i=0;i<4;i++){const[x,y]=s[i],[u,v]=d[i];
+A.push([x,y,1,0,0,0,-u*x,-u*y,u]);A.push([0,0,0,x,y,1,-v*x,-v*y,v])}
+for(let i=0;i<8;i++){let m=i;for(let r=i+1;r<8;r++)if(Math.abs(A[r][i])>Math.abs(A[m][i]))m=r;[A[i],A[m]]=[A[m],A[i]];
+for(let r=0;r<8;r++)if(r!==i){const f=A[r][i]/A[i][i];for(let c=i;c<9;c++)A[r][c]-=f*A[i][c]}}
+return A.map((r,i)=>r[8]/r[i])}
+// 網格模式：Catmull-Rom 雙向曲面，(u,v)∈[0,1] → 螢幕正規化座標
+const cr=(a,b,c,d,t)=>.5*(2*b+(-a+c)*t+(2*a-5*b+4*c-d)*t*t+(-a+3*b-3*c+d)*t*t*t);
+function mp(l,u,v){const n=l.n,P=l.pts,at=(i,j)=>P[Math.min(n-1,Math.max(0,j))*n+Math.min(n-1,Math.max(0,i))];
+const f=s=>{const k=Math.min(n-2,Math.floor(s*(n-1)));return[k,s*(n-1)-k]},[i,tu]=f(u),[j,tv]=f(v);
+const r=[j-1,j,j+1,j+2].map(jj=>[0,1].map(a=>cr(at(i-1,jj)[a],at(i,jj)[a],at(i+1,jj)[a],at(i+2,jj)[a],tu)));
+return[0,1].map(a=>cr(r[0][a],r[1][a],r[2][a],r[3][a],tv))}
+const surf=(l,u,v)=>l.mode==='mesh'?mp(l,u,v):lerp(lerp(l.pts[0],l.pts[1],u),lerp(l.pts[3],l.pts[2],u),v);
+const resample=(l,n)=>{const P=[];for(let j=0;j<n;j++)for(let i=0;i<n;i++)P.push(surf(l,i/(n-1),j/(n-1)));return P};
+function loadThree(){if(window.THREE)return Promise.resolve(true);return th||(th=new Promise(r=>{const s=document.createElement('script');
+s.src='https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';s.onload=()=>r(true);
+s.onerror=()=>{th=null;alert('Three.js 載入失敗：網格模式首次需要連網（載入後可離線）');r(false)};document.head.appendChild(s)}))}
+function initGL(){if(R)return;R=new THREE.WebGLRenderer({alpha:true,antialias:true});R.setClearColor(0,0);R.domElement.id='gl';
+stage.insertBefore(R.domElement,$('#ov'));scene=new THREE.Scene();size()}
+function size(){if(!R)return;R.setPixelRatio(Math.min(devicePixelRatio,2));R.setSize(W,H);cam=new THREE.OrthographicCamera(0,W,0,H,-1,1)}
+function tex(l){if(!l.mesh)return;const c=l.c,T=c.tagName==='VIDEO'?new THREE.VideoTexture(c):c.tagName==='CANVAS'?new THREE.CanvasTexture(c):new THREE.Texture(c);
+T.minFilter=THREE.LinearFilter;T.generateMipmaps=false;
+if(c.tagName==='IMG'){c.complete?T.needsUpdate=true:c.onload=()=>T.needsUpdate=true}
+if(l.mesh.material.map)l.mesh.material.map.dispose();l.mesh.material.map=T;l.mesh.material.needsUpdate=true}
+function mkMesh(l){const uv=[],idx=[];for(let j=0;j<=S;j++)for(let i=0;i<=S;i++)uv.push(i/S,1-j/S);
+for(let j=0;j<S;j++)for(let i=0;i<S;i++){const a=j*(S+1)+i,c=a+S+1;idx.push(a,a+1,c,a+1,c+1,c)}
+const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(new Float32Array((S+1)**2*3),3));
+g.setAttribute('uv',new THREE.Float32BufferAttribute(uv,2));g.setIndex(idx);
+l.mesh=new THREE.Mesh(g,new THREE.MeshBasicMaterial({transparent:true,side:THREE.DoubleSide,depthTest:false,opacity:l.op}));
+l.mesh.frustumCulled=false;scene.add(l.mesh);l.el.style.display='none';tex(l)}
+function dropMesh(l){if(!l.mesh)return;scene.remove(l.mesh);l.mesh.geometry.dispose();l.mesh.material.map?.dispose();l.mesh.material.dispose();l.mesh=null;l.el.style.display=''}
+function upMesh(l){const p=l.mesh.geometry.attributes.position;let k=0;
+for(let j=0;j<=S;j++)for(let i=0;i<=S;i++){const q=mp(l,i/S,j/S);p.setXYZ(k++,q[0]*W,q[1]*H,0)}p.needsUpdate=true}
+function content(l){l.el.innerHTML='';let c;
+if(l.kind==='file'&&l.url){c=document.createElement(l.ft==='video'?'video':'img');c.src=l.url;
+if(l.ft==='video'){c.muted=c.loop=c.autoplay=c.playsInline=true;c.play().catch(()=>{})}}
+else{if(l.kind==='file')l.kind='grid';c=document.createElement('canvas');c.width=BW;c.height=BH}
+l.el.appendChild(c);l.c=c;l.el.style.opacity=l.op;tex(l)}
+function add(k='grid'){if(L.length>=4)return;const l={pts:quad(L.length),kind:k,op:1,mode:'quad',n:4,el:document.createElement('div')};
+l.el.className='layer';stage.insertBefore(l.el,$('#ov'));content(l);L.push(l);sel=L.length-1;ui()}
+function render(){W=innerWidth;H=innerHeight;
+L.forEach((l,i)=>{if(l.mode==='mesh'){if(l.mesh){l.mesh.renderOrder=i;upMesh(l)}return}
+const p=l.pts.map(q=>[q[0]*W,q[1]*H]),h=homo([[0,0],[BW,0],[BW,BH],[0,BH]],p);
+l.el.style.transform=`matrix3d(${h[0]},${h[3]},0,${h[6]},${h[1]},${h[4]},0,${h[7]},0,0,1,0,${h[2]},${h[5]},0,1)`});
+const l=L[sel];if(!l)return;
+hs.forEach((e,i)=>{e.style.left=l.pts[i][0]*W+'px';e.style.top=l.pts[i][1]*H+'px'});
+const P=l.pts.map(q=>q[0]*W+' '+q[1]*H);let d;
+if(l.mode==='mesh'){const n=l.n;d='';for(let j=0;j<n;j++){d+='M'+P.slice(j*n,j*n+n).join('L');
+d+='M'+P.filter((_,k)=>k%n===j).join('L')}}else d='M'+P.join('L')+'Z';
+$('#poly').setAttribute('d',d)}
+function handles(){hs.forEach(e=>e.remove());hs=[];const l=L[sel];if(!l)return;
+l.pts.forEach((_,i)=>{const e=document.createElement('div');e.className='h'+(l.mode==='mesh'?' s':'');if(l.mode!=='mesh')e.textContent=i+1;stage.appendChild(e);hs.push(e);
+e.onpointerdown=ev=>{e.setPointerCapture(ev.pointerId);e.onpointermove=m=>{
+L[sel].pts[i]=[Math.min(1,Math.max(0,m.clientX/W)),Math.min(1,Math.max(0,m.clientY/H))];render()}};
+e.onpointerup=()=>{e.onpointermove=null;save()}})}
+function ui(){const t=$('#tabs');t.innerHTML='';
+L.forEach((_,i)=>{const b=document.createElement('button');b.textContent='圖層 '+(i+1);b.className=i===sel?'on':'';b.onclick=()=>{sel=i;ui()};t.appendChild(b)});
+if(L.length<4){const b=document.createElement('button');b.textContent='＋';b.onclick=()=>add();t.appendChild(b)}
+const l=L[sel];if(l){$('#src').value=l.kind;$('#op').value=l.op;$('#mode').value=l.mode;$('#gn').value=l.n;$('#gn').hidden=l.mode!=='mesh'}handles();render()}
+$('#src').onchange=e=>{const l=L[sel];l.kind=e.target.value;content(l);save()};
+$('#imp').onclick=()=>$('#file').click();
+$('#file').onchange=e=>{const f=e.target.files[0];if(!f)return;const l=L[sel];
+l.kind='file';l.ft=f.type.startsWith('video')?'video':'img';l.url=URL.createObjectURL(f);content(l);
+$('#src').querySelector('[value=file]').disabled=false;$('#src').value='file';e.target.value=''};
+$('#op').oninput=e=>{const l=L[sel];l.op=+e.target.value;l.el.style.opacity=l.op;if(l.mesh)l.mesh.material.opacity=l.op;save()};
+$('#mode').onchange=async e=>{const l=L[sel],m=e.target.value;if(m===l.mode)return;
+if(m==='mesh'){if(!await loadThree()){e.target.value='quad';return}initGL();const n=l.n||4,P=resample(l,n);l.pts=P;l.n=n;l.mode='mesh';mkMesh(l)}
+else{const n=l.n,P=l.pts;l.pts=[P[0],P[n-1],P[n*n-1],P[n*(n-1)]];l.mode='quad';dropMesh(l)}
+ui();save()};
+$('#gn').onchange=e=>{const l=L[sel],n=+e.target.value;l.pts=resample(l,n);l.n=n;ui();save()};
+$('#rst').onclick=()=>{const l=L[sel];l.clip=null;useClip(l);if(l.mode==='mesh'){l.pts=resample({mode:'quad',pts:quad(sel)},l.n)}else l.pts=quad(sel);render();save()};
+$('#del').onclick=()=>{if(L.length<2)return;dropMesh(L[sel]);L[sel].el.remove();L.splice(sel,1);sel=Math.max(0,sel-1);ui();save()};
+let wl;async function out(on){document.body.classList.toggle('out',on);
+try{if(on)wl=await navigator.wakeLock.request('screen');else wl&&wl.release()}catch(e){}}
+$('#out').onclick=()=>out(true);$('#exit').onclick=()=>out(false);
+addEventListener('keydown',e=>{if(e.key==='Escape')out(false)});
+$('#fs').onclick=()=>document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen?.().catch(()=>{});
+function useClip(l){l.el.style.clipPath=l.clip?'polygon('+l.clip.map(p=>p[0].toFixed(1)+'px '+p[1].toFixed(1)+'px').join(',')+')':''}
+function save(){try{localStorage.setItem('pm2',JSON.stringify(L.map(l=>({pts:l.pts,kind:l.kind==='file'?'grid':l.kind,op:l.op,mode:l.mode,n:l.n,clip:l.clip}))))}catch(e){}}
+(function loop(t){t/=1000;L.forEach(l=>{if(l.c&&l.c.getContext){const g=l.c.getContext('2d');
+if(l.kind==='solid'){g.fillStyle='#fff';g.fillRect(0,0,BW,BH)}
+else if(l.kind==='gradient'){const k=g.createLinearGradient(0,0,BW,BH);k.addColorStop(0,`hsl(${t*40%360},90%,55%)`);k.addColorStop(1,`hsl(${(t*40+120)%360},90%,55%)`);g.fillStyle=k;g.fillRect(0,0,BW,BH)}
+else{g.fillStyle='#000';g.fillRect(0,0,BW,BH);g.strokeStyle='#fff';g.lineWidth=2;g.beginPath();
+for(let x=0;x<=BW;x+=40){g.moveTo(x,0);g.lineTo(x,BH)}for(let y=0;y<=BH;y+=40){g.moveTo(0,y);g.lineTo(BW,y)}g.stroke();
+g.strokeStyle='#f44';g.strokeRect(2,2,BW-4,BH-4);g.fillStyle='#4af';g.font='bold 40px sans-serif';g.fillText('L'+(L.indexOf(l)+1),20,60)}
+if(l.mesh&&l.mesh.material.map)l.mesh.material.map.needsUpdate=true}});
+if(R&&L.some(l=>l.mesh))R.render(scene,cam);requestAnimationFrame(loop)})(0);
+addEventListener('resize',()=>{render();size()});
+let dp;addEventListener('beforeinstallprompt',e=>{e.preventDefault();dp=e;$('#ins').hidden=false});
+$('#ins').onclick=()=>{if(dp){dp.prompt();dp=null;$('#ins').hidden=true}};
+if('serviceWorker' in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('sw.js').catch(()=>{});
+try{JSON.parse(localStorage.getItem('pm2')||'[]').forEach(o=>{add(o.kind);const l=L[L.length-1];l.pts=o.pts;l.op=o.op;l.n=o.n||4;if(o.clip){l.clip=o.clip;useClip(l)}l.el.style.opacity=o.op;
+if(o.mode==='mesh'){l.mode='mesh';l.el.style.display='none';loadThree().then(ok=>{if(ok){initGL();mkMesh(l);render()}else{l.mode='quad';l.pts=quad(L.indexOf(l));l.el.style.display='';ui()}})}})}catch(e){}
+if(!L.length)add();sel=0;ui();
+</script><div id="cal"><div id="dot"></div></div>
+<div id="mk"><div id="pw"><canvas id="pc"></canvas><svg id="pv" viewBox="0 0 100 100" preserveAspectRatio="none"><polygon id="pg" fill="#44aaff33" stroke="#4af" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></div>
+<div id="mb"><span id="mh"></span><select id="mmeth"><option value="rg">內建：色彩區域</option><option value="gc">OpenCV：GrabCut 輪廓</option><option value="ed">OpenCV：邊緣四邊形</option></select><button id="mauto">手動點角</button><label id="mclipL" hidden><input type="checkbox" id="mclip" checked>輪廓遮罩</label><label>容差<input id="mtol" type="range" min="10" max="120" value="45"></label><button id="mr">重點</button><button id="ma" class="on">套用投影</button><button id="mc">取消</button></div></div>
+<script>
+// ===== 相機自動校正：投影點閃現 → 相機偵測 → 最小平方單應矩陣 → 相機座標轉投影座標 =====
+const camV=document.createElement('video');camV.muted=camV.playsInline=true;camV.style.cssText='position:fixed;width:2px;height:2px;opacity:0;pointer-events:none';document.body.appendChild(camV);
+const cal=$('#cal'),dot=$('#dot'),wait=ms=>new Promise(r=>setTimeout(r,ms));let stream,mpts=[],photo,Hcp;
+function grab(){const w=800,h=Math.round(w*camV.videoHeight/camV.videoWidth),c=document.createElement('canvas');c.width=w;c.height=h;c.getContext('2d').drawImage(camV,0,0,w,h);return c}
+function lum(c){const d=c.getContext('2d').getImageData(0,0,c.width,c.height).data,o=new Float32Array(c.width*c.height);for(let i=0;i<o.length;i++)o[i]=.3*d[4*i]+.59*d[4*i+1]+.11*d[4*i+2];return o}
+function blob(bl,f){const a=lum(f),w=f.width,h=f.height,d=new Float32Array(a.length);let mx=0;
+for(let i=0;i<a.length;i++){d[i]=a[i]-bl[i];if(d[i]>mx)mx=d[i]}if(mx<35)return null;
+const t=mx*.5;let sx=0,sy=0,sw=0;for(let i=0;i<d.length;i++)if(d[i]>t){sx+=d[i]*(i%w);sy+=d[i]*((i/w)|0);sw+=d[i]}return[sx/sw/w,sy/sw/h]}
+function homoLS(s,d){const M=Array.from({length:8},()=>Array(9).fill(0));
+s.forEach(([x,y],k)=>{const[u,v]=d[k];[[x,y,1,0,0,0,-u*x,-u*y,u],[0,0,0,x,y,1,-v*x,-v*y,v]].forEach(r=>{for(let i=0;i<8;i++)for(let j=0;j<9;j++)M[i][j]+=r[i]*r[j]})});
+for(let i=0;i<8;i++){let m=i;for(let r=i+1;r<8;r++)if(Math.abs(M[r][i])>Math.abs(M[m][i]))m=r;[M[i],M[m]]=[M[m],M[i]];
+for(let r=0;r<8;r++)if(r!==i){const f=M[r][i]/M[i][i];for(let c=i;c<9;c++)M[r][c]-=f*M[i][c]}}return M.map((r,i)=>r[8]/r[i])}
+const ap=(h,x,y)=>{const w=h[6]*x+h[7]*y+1;return[(h[0]*x+h[1]*y+h[2])/w,(h[3]*x+h[4]*y+h[5])/w]};
+const stopCam=()=>{stream&&stream.getTracks().forEach(t=>t.stop());camV.srcObject=null};
+async function scan(){const dl=+$('#dly').value;
+try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}},audio:false});camV.srcObject=stream;await camV.play()}
+catch(e){alert('無法開啟相機：需要 HTTPS 並允許相機權限');return}
+cal.style.display='block';cal.style.background='#000';dot.style.display='none';
+await wait(1500);const base=grab(),bl=lum(base),src=[],dst=[];
+for(const gy of [.12,.5,.88])for(const gx of [.12,.5,.88]){dot.style.cssText=`display:block;left:${gx*100}%;top:${gy*100}%`;await wait(dl);
+const p=blob(bl,grab());if(p){src.push(p);dst.push([gx,gy])}}
+dot.style.display='none';cal.style.background='#bbb';await wait(dl);photo=grab();cal.style.display='none';
+if(src.length<4){stopCam();alert('只偵測到 '+src.length+' 個投影點。請對準投影畫面、調暗環境光，或加大「投影延遲」後重試。');return}
+Hcp=homoLS(src,dst);openMark()}
+function openMark(){$('#mk').classList.add('on');const pc=$('#pc'),pw=$('#pw');pc.width=photo.width;pc.height=photo.height;pc.getContext('2d').drawImage(photo,0,0);
+const s=Math.min(innerWidth/photo.width,(innerHeight-170)/photo.height),w=photo.width*s,h=photo.height*s;
+pw.style.cssText=`position:absolute;left:${(innerWidth-w)/2}px;top:0;width:${w}px;height:${h}px`;mpts=[];mdraw();seed=[.5,.5];mauto=true;$('#mauto').textContent='手動點角';detect()}
+function poly(){$('#pg').setAttribute('points',mpts.map(p=>p[0]*100+','+p[1]*100).join(' '))}
+function mdraw(){const pw=$('#pw');pw.querySelectorAll('.mh').forEach(e=>e.remove());
+mpts.forEach((p,i)=>{const e=document.createElement('div');e.className='mh';e.style.left=p[0]*100+'%';e.style.top=p[1]*100+'%';e.textContent=i+1;pw.appendChild(e);
+e.onpointerdown=ev=>{ev.stopPropagation();e.setPointerCapture(ev.pointerId);e.onpointermove=m=>{const r=pw.getBoundingClientRect();
+mpts[i]=[Math.min(1,Math.max(0,(m.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(m.clientY-r.top)/r.height))];e.style.left=mpts[i][0]*100+'%';e.style.top=mpts[i][1]*100+'%';poly()}};e.onpointerup=()=>e.onpointermove=null});
+poly();$('#mh').textContent=mpts.length<4?`請點選要投影的物件角落（${mpts.length}/4，順序不拘）`:'可拖曳微調，完成後按「套用投影」'}
+$('#pw').onpointerdown=ev=>{const r=$('#pw').getBoundingClientRect(),q=[(ev.clientX-r.left)/r.width,(ev.clientY-r.top)/r.height];if(mauto){seed=q;detect()}else if(mpts.length<4){mpts.push(q);mdraw()}};
+const closeMark=()=>{$('#mk').classList.remove('on');stopCam()};
+$('#mr').onclick=()=>{mpts=[];mdraw()};$('#mc').onclick=closeMark;
+$('#ma').onclick=()=>{if(mpts.length<4)return alert('請先點選 4 個角');
+const c=mpts.reduce((a,p)=>[a[0]+p[0]/4,a[1]+p[1]/4],[0,0]);
+let q=[...mpts].sort((a,b)=>Math.atan2(a[1]-c[1],a[0]-c[0])-Math.atan2(b[1]-c[1],b[0]-c[0]));
+let k=0;q.forEach((p,i)=>{if(p[0]+p[1]<q[k][0]+q[k][1])k=i});q=q.slice(k).concat(q.slice(0,k));
+let clip=false;const Q=q.map(p=>ap(Hcp,p[0],p[1]).map(v=>{if(v<0||v>1)clip=true;return Math.min(1,Math.max(0,v))}));
+const l=L[sel];l.pts=l.mode==='mesh'?resample({mode:'quad',pts:Q},l.n):Q;
+setClip(l,Q);closeMark();handles();render();save();if(clip)alert('部分角落超出投影畫面範圍，已限制在邊緣。')};
+// ===== 自動偵測物件輪廓：色彩區域生長 → 凸包 → 簡化為 4 角 =====
+let seed=[.5,.5],mauto=true;
+function seg(d,sw,sh,sx,sy,tol){const m=new Uint8Array(sw*sh);let r=0,g=0,b=0,n=0;
+for(let y=Math.max(0,sy-2);y<=Math.min(sh-1,sy+2);y++)for(let x=Math.max(0,sx-2);x<=Math.min(sw-1,sx+2);x++){const i=4*(y*sw+x);r+=d[i];g+=d[i+1];b+=d[i+2];n++}
+r/=n;g/=n;b/=n;const t2=tol*tol,q=[sy*sw+sx];m[q[0]]=1;let cnt=0;
+while(q.length){const i=q.pop();cnt++;const x=i%sw,y=(i/sw)|0;
+for(const[j,ok]of[[i-1,x>0],[i+1,x<sw-1],[i-sw,y>0],[i+sw,y<sh-1]]){if(!ok||m[j])continue;const k=4*j,dr=d[k]-r,dg=d[k+1]-g,db=d[k+2]-b;if(dr*dr+dg*dg+db*db<t2){m[j]=1;q.push(j)}}}
+return{m,cnt}}
+const cx=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+function hull(P){P.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);const lo=[],up=[];
+for(const p of P){while(lo.length>1&&cx(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p)}
+for(let i=P.length-1;i>=0;i--){const p=P[i];while(up.length>1&&cx(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p)}
+return lo.slice(0,-1).concat(up.slice(0,-1))}
+function hull4(h){h=h.slice();while(h.length>4){let bi=0,ba=1e18;for(let i=0;i<h.length;i++){
+const a=h[(i+h.length-1)%h.length],c=h[(i+1)%h.length],ar=Math.abs(cx(a,h[i],c));if(ar<ba){ba=ar;bi=i}}h.splice(bi,1)}return h}
+function detectRG(){const pc=$('#pc'),sw=240,sh=Math.round(sw*pc.height/pc.width),c=document.createElement('canvas');c.width=sw;c.height=sh;
+const g=c.getContext('2d');g.drawImage(pc,0,0,sw,sh);
+const d=g.getImageData(0,0,sw,sh).data,{m,cnt}=seg(d,sw,sh,Math.round(seed[0]*(sw-1)),Math.round(seed[1]*(sh-1)),+$('#mtol').value);
+let pm=$('#pm');if(!pm){pm=document.createElement('canvas');pm.id='pm';pm.style.cssText='position:absolute;inset:0;width:100%;height:100%;pointer-events:none';$('#pw').insertBefore(pm,$('#pv'))}
+pm.style.display='';pm.width=sw;pm.height=sh;const im=new ImageData(sw,sh);for(let i=0;i<m.length;i++)if(m[i])im.data.set([70,170,255,110],4*i);pm.getContext('2d').putImageData(im,0,0);
+const B=[];for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){const i=y*sw+x;if(m[i]&&(!x||!y||x==sw-1||y==sh-1||!m[i-1]||!m[i+1]||!m[i-sw]||!m[i+sw]))B.push([x,y])}
+const h=B.length>=4?hull4(hull(B)):[];
+if(cnt<sw*sh*.01||cnt>sw*sh*.9||h.length<4){mpts=[];mdraw();$('#mh').textContent='偵測失敗：請點選物件內部、調整容差，或改手動點角';return}
+mpts=h.map(p=>[(p[0]+.5)/sw,(p[1]+.5)/sh]);mdraw();$('#mh').textContent='已偵測（佔畫面 '+Math.round(cnt/(sw*sh)*100)+'%）：點選物件可重選，滑桿調容差，圓點可微調'}
+$('#mtol').onchange=()=>{if(mauto)detect()};$('#mtol').oninput=()=>{if(mauto&&$('#mmeth').value==='rg')detect()};$('#mmeth').onchange=()=>{if(mauto)detect()};
+$('#mauto').onclick=()=>{mauto=!mauto;$('#mauto').textContent=mauto?'手動點角':'自動偵測';const pm=$('#pm');if(mauto)detect();else{mpts=[];mdraw();if(pm)pm.style.display='none'}};
+// ===== OpenCV.js：GrabCut 輪廓分割 / Canny 邊緣四邊形 =====
+let cvp,cont=null,busy=false;
+function loadCV(){if(window.cv&&cv.Mat)return Promise.resolve(true);return cvp||(cvp=new Promise(r=>{const e=document.createElement('script');e.async=true;e.src='https://docs.opencv.org/4.x/opencv.js';
+e.onerror=()=>{cvp=null;alert('OpenCV.js 載入失敗：首次需要連網（載入後可離線）');r(false)};
+e.onload=async()=>{try{let c=window.cv;if(c&&typeof c.then==='function')window.cv=c=await c;else if(!c.Mat)await new Promise(k=>{c.onRuntimeInitialized=k});r(true)}catch(x){cvp=null;r(false)}};document.head.appendChild(e)}))}
+function cvSolve(kind,d,sw,sh,seed,tol){const del=[],mk=m=>(del.push(m),m),pts=m=>{const a=m.data32S,o=[];for(let i=0;i<a.length;i+=2)o.push([a[i]/sw,a[i+1]/sh]);return o};
+try{const src=mk(cv.matFromArray(sh,sw,cv.CV_8UC4,Array.from(d))),sx=seed[0]*sw,sy=seed[1]*sh,A=sw*sh,cs=mk(new cv.MatVector()),hr=mk(new cv.Mat());
+if(kind==='ed'){const g=mk(new cv.Mat());cv.cvtColor(src,g,cv.COLOR_RGBA2GRAY);cv.GaussianBlur(g,g,new cv.Size(5,5),0);cv.Canny(g,g,tol,tol*3);cv.dilate(g,g,mk(cv.Mat.ones(3,3,cv.CV_8U)));
+cv.findContours(g,cs,hr,cv.RETR_LIST,cv.CHAIN_APPROX_SIMPLE);let best=null,ba=1e18;
+for(let i=0;i<cs.size();i++){const c=mk(cs.get(i)),a=cv.contourArea(c);if(a<.02*A||a>.9*A||a>=ba)continue;const p=mk(new cv.Mat());cv.approxPolyDP(c,p,.02*cv.arcLength(c,true),true);
+if(p.rows===4&&cv.isContourConvex(p)&&cv.pointPolygonTest(p,new cv.Point(sx,sy),false)>=0){best=pts(p);ba=a}}
+return best&&{q:best,cont:best}}
+const rgb=mk(new cv.Mat());cv.cvtColor(src,rgb,cv.COLOR_RGBA2RGB);const u=Math.min(sw,sh),mask=mk(new cv.Mat(sh,sw,cv.CV_8UC1,new cv.Scalar(cv.GC_PR_BGD)));
+cv.circle(mask,new cv.Point(sx,sy),Math.round(u*.28),new cv.Scalar(cv.GC_PR_FGD),-1);
+cv.circle(mask,new cv.Point(sx,sy),Math.round(u*.06),new cv.Scalar(cv.GC_FGD),-1);
+cv.rectangle(mask,new cv.Point(0,0),new cv.Point(sw-1,sh-1),new cv.Scalar(cv.GC_BGD),4);
+cv.grabCut(rgb,mask,new cv.Rect(0,0,sw,sh),mk(new cv.Mat()),mk(new cv.Mat()),3,cv.GC_INIT_WITH_MASK);
+const bin=mk(new cv.Mat(sh,sw,cv.CV_8UC1));bin.data.set(Uint8Array.from(mask.data,v=>v==1||v==3?255:0));
+cv.findContours(bin,cs,hr,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);let c=null,ba=0;
+for(let i=0;i<cs.size();i++){const m=mk(cs.get(i)),a=cv.contourArea(m);if(a>ba){ba=a;c=m}}
+if(!c||ba<.01*A||ba>.9*A)return null;
+const hl=mk(new cv.Mat());cv.convexHull(c,hl,false,true);const hp=cv.arcLength(hl,true);let q=null;
+for(let e=.01;e<=.12&&!q;e+=.005){const a=mk(new cv.Mat());cv.approxPolyDP(hl,a,e*hp,true);if(a.rows===4)q=pts(a)}
+if(!q)q=cv.RotatedRect.points(cv.minAreaRect(hl)).map(p=>[p.x/sw,p.y/sh]);
+const o=mk(new cv.Mat());cv.approxPolyDP(c,o,.008*cv.arcLength(c,true),true);return{q,cont:pts(o)}
+}finally{del.forEach(m=>{try{m.delete()}catch(e){}})}}
+async function detect(){if(busy)return;cont=null;$('#mclipL').hidden=true;const k=$('#mmeth').value;if(k==='rg')return detectRG();
+busy=true;const mh=$('#mh');try{mh.textContent='載入 OpenCV.js…（首次約 10MB，請稍候）';
+if(!await loadCV()){$('#mmeth').value='rg';return detectRG()}
+mh.textContent='分析中…';await wait(30);const pc=$('#pc'),sw=320,sh=Math.round(sw*pc.height/pc.width),t=document.createElement('canvas');t.width=sw;t.height=sh;
+const g=t.getContext('2d');g.drawImage(pc,0,0,sw,sh);const r=cvSolve(k,g.getImageData(0,0,sw,sh).data,sw,sh,seed,+$('#mtol').value);
+if(!r){mpts=[];mdraw();mh.textContent=k==='ed'?'找不到包含該點的四邊形：請點選物件、調整容差，或改用 GrabCut':'偵測失敗：請點選物件中央、改用其他方法或手動點角';return}
+mpts=r.q;cont=r.cont;mdraw();$('#mclipL').hidden=false;
+let pm=$('#pm');if(!pm){pm=document.createElement('canvas');pm.id='pm';pm.style.cssText='position:absolute;inset:0;width:100%;height:100%;pointer-events:none';$('#pw').insertBefore(pm,$('#pv'))}
+pm.style.display='';pm.width=sw;pm.height=sh;const x=pm.getContext('2d');x.fillStyle='rgba(70,170,255,.4)';x.beginPath();cont.forEach((p,i)=>x[i?'lineTo':'moveTo'](p[0]*sw,p[1]*sh));x.closePath();x.fill();
+mh.textContent='OpenCV 已偵測輪廓（'+cont.length+' 個頂點）：圓點可微調，可勾選「輪廓遮罩」'}
+catch(e){console.error(e);mh.textContent='OpenCV 發生錯誤，已改用內建方法';$('#mmeth').value='rg';detectRG()}finally{busy=false}}
+function setClip(l,Q){l.clip=null;useClip(l);if(!cont||!$('#mclip').checked||l.mode==='mesh')return;
+const h=homo(Q.map(p=>[p[0]*W,p[1]*H]),[[0,0],[BW,0],[BW,BH],[0,BH]]);
+l.clip=cont.map(p=>{const q=ap(Hcp,p[0],p[1]);return ap(h,q[0]*W,q[1]*H)});useClip(l)}
+$('#cam').onclick=scan;
+</script></body></html>
